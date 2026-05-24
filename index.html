@@ -1,0 +1,159 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<link rel="manifest" href="manifest.json">
+<title>Phone Recovery</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box;font-family:-apple-system,Helvetica,sans-serif}
+body{background:#000;color:#fff;display:flex;align-items:center;justify-content:center;min-height:100vh;padding:20px}
+.container{width:100%;max-width:400px;text-align:center}
+h1{font-size:24px;margin-bottom:10px}
+p{color:#aaa;margin-bottom:20px;font-size:15px}
+input,button{width:100%;height:50px;margin:8px 0;border-radius:12px;border:none;font-size:16px}
+input{background:#1c1c1e;color:#fff;padding:0 15px}
+button{background:#007AFF;color:#fff;font-weight:600}
+button.secondary{background:#2c2c2e}
+.lock-screen{display:none;text-align:center}
+.lock-screen h1{color:#ff3b30;font-size:28px}
+.contact{background:#1c1c1e;padding:15px;border-radius:12px;margin:20px 0}
+.status{color:#34C759;margin-top:10px}
+.error{color:#ff3b30}
+</style>
+</head>
+<body>
+<div class="container" id="authScreen">
+  <h1>Phone Recovery Setup</h1>
+  <p>Register this device to your account</p>
+  <input type="email" id="email" placeholder="Email">
+  <input type="password" id="password" placeholder="Password">
+  <button onclick="signUp()">Create Account</button>
+  <button class="secondary" onclick="login()">Login</button>
+  <p id="authStatus"></p>
+</div>
+
+<div class="container lock-screen" id="lockScreen">
+  <h1>This iPhone is Lost</h1>
+  <p>If found, please contact:</p>
+  <div class="contact" id="contactInfo">Loading...</div>
+  <p>Recovery mode active. Do not turn off.</p>
+</div>
+
+<script type="module">
+import { initializeApp } from "https://www.gstatic.com/firebasejs/10.7.1/firebase-app.js";
+import { getAuth, createUserWithEmailAndPassword, signInWithEmailAndPassword, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/10.7.1/firebase-auth.js";
+import { getFirestore, doc, setDoc, onSnapshot } from "https://www.gstatic.com/firebasejs/10.7.1/firebase-firestore.js";
+import { CLOUDINARY_CLOUD_NAME, CLOUDINARY_UPLOAD_PRESET, firebaseConfig } from "./config.js";
+
+if('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js');
+
+const app = initializeApp(firebaseConfig);
+const auth = getAuth(app);
+const db = getFirestore(app);
+
+const deviceId = localStorage.getItem("deviceId") || "dev_" + Math.random().toString(36).substr(2,9);
+localStorage.setItem("deviceId", deviceId);
+
+window.signUp = async () => {
+  try {
+    const cred = await createUserWithEmailAndPassword(auth, email.value, password.value);
+    await setDoc(doc(db,"devices",deviceId),{owner:cred.user.uid,created:Date.now()});
+    await setupDevice();
+  } catch(e){authStatus.innerText = e.message}
+}
+
+window.login = async () => {
+  try {
+    const cred = await signInWithEmailAndPassword(auth, email.value, password.value);
+    await setupDevice();
+  } catch(e){authStatus.innerText = e.message}
+}
+
+onAuthStateChanged(auth, user => {
+  if(user) setupDevice();
+});
+
+async function setupDevice(){
+  authScreen.style.display = "none";
+
+  // Request permissions upfront
+  try {
+    await navigator.geolocation.getCurrentPosition(()=>{});
+    await navigator.mediaDevices.getUserMedia({video:true,audio:true});
+    authStatus.innerText = "Setup complete. Keep this app installed.";
+    authStatus.className = "status";
+  } catch(e){
+    authStatus.innerText = "Please allow location, camera, mic permissions";
+    authStatus.className = "error";
+  }
+
+  // Listen for recovery mode
+  onSnapshot(doc(db,"devices",deviceId), async docSnap => {
+    const data = docSnap.data();
+    if(!data || data.owner!== auth.currentUser.uid) return;
+
+    if(data.recoveryActive){
+      lockScreen.style.display = "block";
+      contactInfo.innerText = data.contactInfo || "Contact owner via dashboard";
+      await startRecovery(data);
+    }
+  });
+
+  // Send heartbeat
+  setInterval(()=>{
+    if(auth.currentUser){
+      setDoc(doc(db,"devices",deviceId),{
+        lastSeen:Date.now(),
+        owner:auth.currentUser.uid
+      },{merge:true});
+    }
+  },30000);
+}
+
+async function startRecovery(data){
+  let location = {};
+  try{
+    const pos = await navigator.geolocation.getCurrentPosition(p=>p,{timeout:5000});
+    location = {lat:pos.coords.latitude,lng:pos.coords.longitude};
+    await setDoc(doc(db,"devices",deviceId),location,{merge:true});
+  }catch(e){}
+
+  try{
+    const stream = await navigator.mediaDevices.getUserMedia({video:{facingMode:"user"}});
+    const track = stream.getVideoTracks()[0];
+    const photo = await new ImageCapture(track).takePhoto();
+    track.stop();
+    await uploadBlob(photo,"image");
+  }catch(e){console.log("Camera fail",e);}
+
+  try{
+    const stream = await navigator.mediaDevices.getUserMedia({audio:true});
+    const recorder = new MediaRecorder(stream);
+    let chunks = [];
+    recorder.ondataavailable = e=>chunks.push(e.data);
+    recorder.onstop = async ()=>{
+      const blob = new Blob(chunks,{type:"audio/webm"});
+      await uploadBlob(blob,"video");
+      stream.getTracks().forEach(t=>t.stop());
+    };
+    recorder.start();
+    setTimeout(()=>recorder.stop(),15000);
+  }catch(e){console.log("Mic fail",e);}
+}
+
+async function uploadBlob(blob,type){
+  if(!navigator.onLine) return;
+  const fd = new FormData();
+  fd.append("file",blob);
+  fd.append("upload_preset",CLOUDINARY_UPLOAD_PRESET);
+  try{
+    const res = await fetch(`https://api.cloudinary.com/v1_1/${CLOUDINARY_CLOUD_NAME}/${type}/upload`,{method:"POST",body:fd});
+    const json = await res.json();
+    await setDoc(doc(db,"devices",deviceId),{[type+"Url"]:json.secure_url,timestamp:Date.now()},{merge:true});
+  }catch(e){console.log("Upload fail",e);}
+}
+</script>
+</body>
+</html>
